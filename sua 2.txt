@@ -1,0 +1,821 @@
+// ----------------BANLINHKIEN.COM--------------
+// BLKLab : Loa Thông Báo Chuyển Khoản ESP32 BLK 
+// Ngày : 17/02/2025
+// Hướng dẫn sử dụng:
+// Màn hình chính mặc định hiển thị 3 giao dịch tiền vào gần nhất
+// Chức năng nút nhấn BOOT:
+//   - Nhấn nhanh 1 lần để tăng âm lượng:
+//   - Nhấn giữ 3s để vào chế độ cài đặt: Giữ nút BOOT trên kit esp32 để vào chế độ APMODE, esp32 sẽ phát ra wifi tên Tingbox, 
+//     Kết nối vào wifi đó, truy cập 192.168.4.1, cấu hình các thông số:
+//       + tên WIFI
+//       + Mật khẩu WIFI
+//       + API Token của Sepay
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include "index_html.h"
+#include "data_config.h"
+#include <EEPROM.h>
+#include <Arduino_JSON.h>
+#include "icon.h"
+#include <HTTPClient.h>
+#include "Audio.h"
+
+
+// Khai báo I2S
+#define I2S_DOUT 25
+#define I2S_BCLK 27
+#define I2S_LRC 26
+Audio audio;
+bool isPlaying = false;
+HTTPClient http;
+
+// Cập nhật cấu trúc Transaction
+struct Transaction {
+    String refNo;              // Mã giao dịch
+    String tranId;             // ID giao dịch
+    String postingDate;        // Ngày ghi sổ
+    String transactionDate;    // Ngày giao dịch
+    String accountNo;          // Số tài khoản
+    int creditAmount;          // Tiền vào (credit)
+    int debitAmount;           // Tiền ra (debit)
+    String currency;           // Loại tiền
+    String description;        // Nội dung giao dịch
+    String availableBalance;   // Số dư khả dụng
+    String beneficiaryAccount; // Tài khoản người nhận
+};
+// Đường dẫn các file WAV trong SPIFFS
+const char* audio_enter_setup = "/enter_setup.wav";
+const char* audio_setup_done = "/setup_done.wav";
+const char* audio_wifi_connected = "/wifi_connected.wav";
+const char* audio_wifi_fail = "/wifi_fail.wav";
+const char* audio_wifi_not_found = "/wifi_not_found.wav";
+Transaction transactions[3];
+int soLuongGD = 0;
+
+String apiUrl = "";
+String url_ting_ting = "https://tiengdong.com/wp-content/uploads/Tieng-tinh-tinh-www_tiengdong_com.mp3";
+String reference_number_now = "";  // Biến lưu mã tham chiếu từ lần đọc trước 
+
+uint8_t trigAudio = 0;
+int amount_inGiaoDich = 0;
+uint8_t firstTrans = 0;
+int countTaskReadSepay = 0;
+// Create AsyncWebServer object on port 80
+AsyncWebServer server(80);
+
+
+// Một số Macro
+#define ENABLE    1
+#define DISABLE   0
+// ---------------------- Khai báo cho OLED 1.3 --------------------------
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+
+#define i2c_Address 0x3C //initialize with the I2C addr 0x3C Typically eBay OLED's
+//#define i2c_Address 0x3d //initialize with the I2C addr 0x3D Typically Adafruit OLED's
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+#define OLED_RESET -1   //   QT-PY / XIAO
+Adafruit_SH1106G oled = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+#define NUMFLAKES 10
+#define XPOS 0
+#define YPOS 1
+#define DELTAY 2
+
+#define OLED_SDA      21
+#define OLED_SCL      22
+
+typedef enum {
+  SCREEN0,
+  SCREEN1,
+  SCREEN2,
+  SCREEN3,
+  SCREEN4,
+  SCREEN5,
+  SCREEN6,
+  SCREEN7,
+  SCREEN8,
+  SCREEN9,
+  SCREEN10,
+  SCREEN11,
+  SCREEN12,
+  SCREEN13
+}SCREEN;
+int screenOLED = SCREEN0;
+int countSCREEN9 = 0;
+bool enableShow = DISABLE;
+int Volume = 10;
+// Khai bao LED
+#define LED           2
+// Khai báo BUZZER
+#define BUZZER        4
+#define BUZZER_ON     0
+#define BUZZER_OFF    1
+//-------------------- Khai báo Button-----------------------
+#include "mybutton.h"
+
+#define BUTTON_SET_PIN    0
+
+#define BUTTON1_ID  1
+
+Button buttonSET;
+Button buttonDOWN;
+Button buttonUP;
+void button_press_short_callback(uint8_t button_id);
+void button_press_long_callback(uint8_t button_id);
+//------------------------------------------------------------
+TaskHandle_t TaskButton_handle      = NULL;
+TaskHandle_t TaskOLEDDisplay_handle = NULL;
+TaskHandle_t TaskDHT11_handle = NULL;
+TaskHandle_t TaskDustSensor_handle = NULL;
+TaskHandle_t TaskAutoWarning_handle = NULL;
+
+void setup(){
+  Serial.begin(115200);
+  // Đọc data setup từ eeprom
+  EEPROM.begin(512);
+  readEEPROM();
+  // Khởi tạo URL API động sau khi đọc dữ liệu từ EEPROM
+    apiUrl = "https://apicanhan.com/api/mbbank?key=8c622baf3efef5ef8386a082933d946";
+    apiUrl += "&username=" + EApiKey; // Thêm username từ EApiKey
+    apiUrl += "&password=" + EVAacount; // Thêm password từ EVAacount
+    apiUrl += "&accountNo=" + EApiKey; // Thêm accountNo từ EApiKey
+    // Debug URL để kiểm tra
+    Serial.print("Generated API URL: ");
+    Serial.println(apiUrl);
+    // Khởi tạo LED
+  pinMode(LED, OUTPUT);
+  // Khởi tạo BUZZER
+  pinMode(BUZZER, OUTPUT);
+  digitalWrite(BUZZER, BUZZER_OFF);
+  // Khởi tạo OLED
+  oled.begin(i2c_Address, true);
+  oled.setTextSize(2);
+  oled.setTextColor(SH110X_WHITE);
+  //khởi tạo spiffs
+  if (!SPIFFS.begin(true)) { // Format SPIFFS if not initialized
+  Serial.println("[ERROR] Failed to initialize SPIFFS.");
+  while (1); // Stop execution if SPIFFS initialization fails
+  }
+  // Khởi tạo nút nhấn
+  pinMode(BUTTON_SET_PIN, INPUT_PULLUP);
+
+  button_init(&buttonSET, BUTTON_SET_PIN, BUTTON1_ID);
+  button_pressshort_set_callback((void *)button_press_short_callback);
+  button_presslong_set_callback((void *)button_press_long_callback);
+  xTaskCreatePinnedToCore(TaskReadSepay, "TaskReadSepay" ,      1024*20 ,  NULL,  24 ,  NULL ,  1);
+  xTaskCreatePinnedToCore(TaskButton,          "TaskButton" ,          1024*10 ,  NULL,  10 ,  &TaskButton_handle       , 1);
+  Evolume = EEPROM.read(220);
+  if(Evolume == 255) Evolume = 10;
+  Serial.print("Volume:");
+  Serial.println(Evolume);
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  audio.setVolume(Evolume);
+  
+  // Kết nối wifi
+  connectSTA();
+}
+
+void loop() {
+  vTaskDelete(NULL);
+}
+int tienNhan[3] = {0,0,0};
+void themTien(int i) {
+    // Dịch các phần tử sang trái
+    tienNhan[0] = tienNhan[1];
+    tienNhan[1] = tienNhan[2];
+    tienNhan[2] = i; // Gán giá trị mới vào phần tử cuối
+}
+// hàm kiểm tra bộ nhớ RAM
+void checkHeap(const char* message) {
+    Serial.print(message);
+    Serial.print(" Free heap: ");
+    Serial.println(ESP.getFreeHeap());
+    Serial.print("Heap fragmentation: ");
+    Serial.print("Largest free block: ");
+    Serial.println(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    Serial.print("Free heap: ");
+    Serial.println(heap_caps_get_free_size(MALLOC_CAP_8BIT));
+}
+bool enableReadSepay = 0;
+void TaskReadSepay(void *pvParameters) {
+    while (true) { // Vòng lặp vô hạn, có thể đổi thành điều kiện cụ thể
+        countTaskReadSepay++;
+        Serial.println(countTaskReadSepay);
+
+        if (trigAudio == 0 && countTaskReadSepay >= 6 && enableReadSepay == 1) {
+            countTaskReadSepay = 0;
+
+            if (WiFi.status() == WL_CONNECTED && trigAudio == 0) {
+                HTTPClient http;
+                http.begin("https://apicanhan.com/api/mbbank?key=8c622baf3efef5ef8386a082933d9467&username=0392605784&password=Abcdefgh152&accountNo=0392605784");
+                http.addHeader("Content-Type", "application/json");
+
+                int httpResponseCode = http.GET();
+                if (httpResponseCode == 200) {
+                    String response = http.getString();
+                    Serial.println("Response:");
+                    Serial.println(response);
+                    checkHeap("Trước khi phân tích JSON:");
+                    JSONVar jsonObj = JSON.parse(response);
+                    checkHeap("Sau khi phân tích JSON:");
+                    if (JSON.typeof(jsonObj) == "undefined") {
+                        Serial.println("Failed to parse JSON");
+                        continue;
+                    }
+
+                    JSONVar tranList = jsonObj["TranList"];
+                    int numTransactions = tranList.length();
+                    int i = 0;
+                    for (int j = 0; j < numTransactions && i < 3; j++) {
+                        char refNo[50] = ""; // Giả sử mã tham chiếu tối đa 50 ký tự
+                        char creditAmountStr[10] = "";
+
+                        if (tranList[j].hasOwnProperty("refNo")) {
+                            strncpy(refNo, (const char*)tranList[j]["refNo"], sizeof(refNo) - 1);
+                        }
+                          int creditAmount = 0;
+                        if (tranList[j].hasOwnProperty("creditAmount")) {
+                            strncpy(creditAmountStr, (const char*)tranList[j]["creditAmount"], sizeof(creditAmountStr) - 1);
+                            creditAmount = atoi(creditAmountStr); // Chuyển đổi chuỗi thành số nguyên
+                        }
+
+                        // Bỏ qua giao dịch nếu thiếu trường quan trọng
+                        if (strlen(refNo) == 0 || creditAmount <= 0) {
+                        Serial.print("Giao dịch [");
+                        Serial.print(j);
+                        Serial.println("] không hợp lệ, bỏ qua.");
+                        continue;
+                        }
+
+                        // Gán giá trị hợp lệ vào transactions
+                        transactions[i].refNo = refNo;
+                        transactions[i].creditAmount = creditAmount;
+                        i++;
+                    }
+                    jsonObj = JSONVar();
+                    if (firstTrans == 0) {
+                        firstTrans = 1;
+                        reference_number_now = transactions[i - 1].refNo;
+                        Serial.println("Giao dịch đầu tiên được thiết lập.");
+                        tienNhan[0] = transactions[0].creditAmount;
+                        if (i > 1) tienNhan[1] = transactions[1].creditAmount;
+                        if (i > 2) tienNhan[2] = transactions[2].creditAmount;
+                    } else {
+                        int viTri = kiemTraRefNo(reference_number_now);
+                        if (viTri == -1) {
+                            Serial.println("Không có giao dịch mới hoặc mã tham chiếu không tồn tại.");
+                        } else {
+                            reference_number_now = transactions[viTri].refNo;
+                            amount_inGiaoDich = transactions[viTri].creditAmount;
+                            if (amount_inGiaoDich > 0) {
+                                trigAudio = 1;
+                                themTien(amount_inGiaoDich);
+                                printTransactions(viTri);
+                            }
+                        }
+                    }
+                } else {
+                    Serial.print("Lỗi HTTP: ");
+                    Serial.println(httpResponseCode);
+                }
+                http.end(); // Giải phóng HTTPClient
+            }
+        }
+       // phát âm thanh khi có giao dịch mới
+        if (!isPlaying && trigAudio == 1) {  
+            Serial.println("Playing audio...");
+            isPlaying = 1;
+            enableShow = DISABLE;
+            audio.connecttohost(url_ting_ting.c_str());  // Phát tiếng ting ting trước
+            audio.loop();
+        }
+        if (isPlaying) {
+          if (audio.isRunning() && trigAudio > 0) {
+            audio.loop();
+          } else {
+            if(trigAudio == 1) {
+                Serial.println("Audio finished 1");
+                trigAudio = 2;
+                String message = "Thanh toán thành công " + String(amount_inGiaoDich) + " đồng";
+                const char* messageChar = message.c_str();
+                audio.connecttospeech(messageChar, "vi");   // Phát âm thanh thanh toán thành công
+            } else if (trigAudio == 2) {
+                isPlaying = 0;  // Reset để lần sau có thể phát tiếp
+                trigAudio = 0;
+                enableShow = ENABLE;
+                xTaskCreatePinnedToCore(TaskButton,          "TaskButton" ,          1024*10 ,  NULL,  5 ,   &TaskButton_handle       , 1);
+                Serial.println("Audio finished 2");
+            } 
+          }
+        }
+
+        switch(screenOLED) {
+          case SCREEN0: // Hiệu ứng khởi động
+            for(int j = 0; j < 3; j++) {
+              for(int i = 0; i < FRAME_COUNT_loadingOLED; i++) {
+                oled.clearDisplay();
+                oled.drawBitmap(32, 0, loadingOLED[i], FRAME_WIDTH_64, FRAME_HEIGHT_64, 1);
+                oled.display();
+                delay(FRAME_DELAY/4);
+              }
+            }
+            screenOLED = SCREEN4;
+            break;
+          case SCREEN1:  
+            for(int i = 0; i < FRAME_COUNT_Money && enableShow == ENABLE; i++) {
+              oled.clearDisplay();
+              oled.setTextSize(1.5);
+              oled.setCursor(60, 5);
+              oled.print(String(tienNhan[0]) + " vnd");
+              oled.setCursor(60, 25);
+              oled.print(String(tienNhan[1]) + " vnd");
+              oled.setCursor(60, 45);
+              oled.print(String(tienNhan[2]) + " vnd");
+              clearRectangle(0, 0, 32, 64);
+              oled.drawBitmap(16, 16, moneyOLED[i], FRAME_WIDTH_32, FRAME_HEIGHT_32, 1);
+              oled.display();
+              delay(FRAME_DELAY);
+            }
+            oled.display();
+
+            break;
+          case SCREEN2:   
+            oled.clearDisplay();
+            oled.setTextSize(2);
+            oled.setCursor(60, 25);
+            oled.print(String(Evolume) + "%");
+            if(Evolume == 0) {  
+              oled.drawBitmap(16, 16, speakerMuteOLED[FRAME_COUNT_speakerMuteOLED - 1], FRAME_WIDTH_32, FRAME_HEIGHT_32, 1);
+            }
+            else {
+              oled.drawBitmap(16, 16, speakerOLED[FRAME_COUNT_speakerOLED - 1], FRAME_WIDTH_32, FRAME_HEIGHT_32, 1);
+            }
+            oled.display();
+            delay(FRAME_DELAY);
+            oled.display();
+
+            delay(300);
+            enableShow = ENABLE;
+            if( enableShow == ENABLE)
+              screenOLED = SCREEN3;
+            break;
+          case SCREEN3:  
+
+            delay(1000);
+            if( enableShow == ENABLE)
+              screenOLED = SCREEN1;
+            break; 
+          case SCREEN4:    // Đang kết nối Wifi
+            oled.clearDisplay();
+            oled.setTextSize(1);
+            oled.setCursor(40, 5);
+            oled.print("WIFI");
+            oled.setTextSize(1.5);
+            oled.setCursor(40, 17);
+            oled.print("Dang ket noi..");
+        
+            for(int i = 0; i < FRAME_COUNT_wifiOLED; i++) {
+              clearRectangle(0, 0, 32, 32);
+              oled.drawBitmap(0, 0, wifiOLED[i], FRAME_WIDTH_32, FRAME_HEIGHT_32, 1);
+              oled.display();
+              delay(FRAME_DELAY);
+            }
+            break;
+          case SCREEN5:    // Kết nối wifi thất bại
+              oled.clearDisplay();
+              oled.setTextSize(1);
+              oled.setCursor(40, 5);
+              oled.print("WIFI");
+              oled.setTextSize(1.5);
+              oled.setCursor(40, 17);
+              oled.print("Mat ket noi.");
+              oled.drawBitmap(0, 0, wifiOLED[FRAME_COUNT_wifiOLED - 1 ], FRAME_WIDTH_32, FRAME_HEIGHT_32, 1);
+              oled.drawLine(31, 0 , 0, 31 , 1);
+              oled.drawLine(32, 0 , 0, 32 , 1);
+              oled.display();
+              delay(2000);
+              screenOLED = SCREEN9;
+            break;
+          case SCREEN6:   // Đã kết nối Wifi, đang kết nối Blynk
+
+            break;
+          case SCREEN7:   // Đã kết nối Wifi
+              oled.clearDisplay();
+              oled.setTextSize(1);
+              oled.setCursor(40, 5);
+              oled.print("WIFI");
+              oled.setTextSize(1.5);
+              oled.setCursor(40, 17);
+              oled.print("Da ket noi.");
+              oled.drawBitmap(0, 0, wifiOLED[FRAME_COUNT_wifiOLED - 1 ], FRAME_WIDTH_32, FRAME_HEIGHT_32, 1);
+              delay(3000);
+              screenOLED = SCREEN1;
+              enableShow = ENABLE;
+            break;
+          case SCREEN8:   
+              oled.clearDisplay();
+              delay(2000);
+              screenOLED = SCREEN9;
+            break;
+          case SCREEN9:   // Cai đặt 192.168.4.1
+              oled.clearDisplay();
+              oled.setTextSize(1);
+              oled.setCursor(40, 5);
+              oled.setTextSize(1);
+              oled.print("Ket noi Wifi:");
+              oled.setCursor(40, 17);
+              oled.setTextSize(1);
+              oled.print("TingBox");
+
+              oled.setCursor(40, 38);
+              oled.print("Dia chi IP:");
+      
+              oled.setCursor(40, 50);
+              oled.print("192.168.4.1");
+
+              for(int i = 0; i < FRAME_COUNT_settingOLED; i++) {
+                clearRectangle(0, 0, 32, 64);
+                oled.drawBitmap(0, 16, settingOLED[i], FRAME_WIDTH_32, FRAME_HEIGHT_32, 1);
+                oled.display();
+                delay(FRAME_DELAY*4);
+              }
+              countSCREEN9++;
+              if(countSCREEN9 > 10) {
+                countSCREEN9 = 0;
+                screenOLED = SCREEN1;
+                enableShow = ENABLE;
+              }
+
+              break;
+            case SCREEN10:    // auto : on
+              oled.clearDisplay();
+              oled.setTextSize(1);
+              oled.setCursor(40, 20);
+              oled.print("Canh bao:");
+              oled.setTextSize(2);
+              oled.setCursor(40, 32);
+              oled.print("DISABLE"); 
+              for(int i = 0; i < FRAME_COUNT_autoOnOLED; i++) {
+                clearRectangle(0, 0, 32, 64);
+                oled.drawBitmap(0, 16, autoOnOLED[i], FRAME_WIDTH_32, FRAME_HEIGHT_32, 1);
+                oled.display();
+                delay(FRAME_DELAY);
+              }
+              clearRectangle(40, 32, 128, 64);
+              oled.setCursor(40, 32);
+              oled.print("ENABLE"); 
+              oled.display();   
+              delay(2000);
+              screenOLED = SCREEN1;
+              enableShow = ENABLE;
+              break;
+            case SCREEN11:     // auto : off
+              oled.clearDisplay();
+              oled.setTextSize(1);
+              oled.setCursor(40, 20);
+              oled.print("Canh bao:");
+              oled.setTextSize(2);
+              oled.setCursor(40, 32);
+              oled.print("ENABLE");
+              for(int i = 0; i < FRAME_COUNT_autoOffOLED; i++) {
+                clearRectangle(0, 0, 32, 64);
+                oled.drawBitmap(0, 16, autoOffOLED[i], FRAME_WIDTH_32, FRAME_HEIGHT_32, 1);
+                oled.display();
+                delay(FRAME_DELAY);
+              }
+              clearRectangle(40, 32, 128, 64);
+              oled.setCursor(40, 32);
+              oled.print("DISABLE"); 
+              oled.display();    
+              delay(2000);
+              screenOLED = SCREEN1;  
+              enableShow = ENABLE;
+              break;
+            case SCREEN12:  // gui du lieu len blynk
+
+              delay(1000);
+              screenOLED = SCREEN1; 
+              enableShow = ENABLE;
+              break;
+            case SCREEN13:   // khoi dong lai
+              oled.clearDisplay();
+              oled.setTextSize(1);
+              oled.setCursor(0, 20);
+              oled.print("Khoi dong lai");
+              oled.setCursor(0, 32);
+              oled.print("Vui long doi ..."); 
+              oled.display();
+              break;
+            default : 
+              delay(10);
+              break;
+        } 
+           
+    }
+}
+
+// In giao dịch
+void printTransactions(int i) {
+    Serial.println("\nTransactions:");
+    Serial.println("--------------------");
+    Serial.println("Ref No: " + transactions[i].refNo);
+    Serial.println("Transaction ID: " + transactions[i].tranId);
+    Serial.println("Posting Date: " + transactions[i].postingDate);
+    Serial.println("Transaction Date: " + transactions[i].transactionDate);
+    Serial.println("Account No: " + transactions[i].accountNo);
+    Serial.print("Credit Amount: "); Serial.println(transactions[i].creditAmount);
+    Serial.print("Debit Amount: "); Serial.println(transactions[i].debitAmount);
+    Serial.println("Currency: " + transactions[i].currency);
+    Serial.println("Description: " + transactions[i].description);
+    Serial.println("Available Balance: " + transactions[i].availableBalance);
+    Serial.println("Beneficiary Account: " + transactions[i].beneficiaryAccount);
+    Serial.println("--------------------");
+}
+
+
+
+// Hàm kiểm tra mã tham chiếu có trong danh sách không
+int kiemTraRefNo(String refNo) {
+    for (int i = 0; i < 3; i++) {
+        if (transactions[i].refNo == refNo) {
+            return i; // Trả về vị trí nếu tìm thấy
+        }
+    }
+    return -1; // Không tìm thấy
+}
+// Xóa 1 ô hình chữ nhật từ tọa độ (x1,y1) đến (x2,y2)
+void clearRectangle(int x1, int y1, int x2, int y2) {
+   for(int i = y1; i < y2; i++) {
+     oled.drawLine(x1, i, x2, i, 0);
+   }
+}
+
+void clearOLED(){
+  oled.clearDisplay();
+  oled.display();
+}
+
+//Hàm phát âm thanh
+void playAudio(const char* audioFile) {
+
+  if (SPIFFS.exists(audioFile)) {
+    audio.connecttoFS(SPIFFS, audioFile);
+
+    while (audio.isRunning()) {
+      audio.loop();
+      delay(10); // Đảm bảo phát xong file
+    }
+  }
+}
+
+//-----------------Kết nối STA wifi, chuyển sang wifi AP nếu kết nối thất bại ----------------------- 
+void connectSTA() {
+      delay(5000);
+      enableShow = DISABLE;
+      if ( Essid.length() > 1 ) {  
+      Serial.println(Essid);        //Print SSID
+      Serial.println(Epass);        //Print Password
+
+      WiFi.begin(Essid.c_str(), Epass.c_str());   //c_str()
+      int countConnect = 0;
+      while (WiFi.status() != WL_CONNECTED) {
+          delay(500);   
+          if(countConnect++  == 15) {
+            Serial.println("Ket noi Wifi that bai");
+            Serial.println("Kiem tra SSID & PASS");
+            Serial.println("Ket noi Wifi: ESP32 de cau hinh");
+            Serial.println("IP: 192.168.4.1");
+            screenOLED = SCREEN5;
+            digitalWrite(BUZZER, BUZZER_ON);
+            delay(2000);
+            digitalWrite(BUZZER, BUZZER_OFF);
+            delay(3000);
+            // Phát thông báo không tìm thấy WiFi
+            playAudio(audio_wifi_not_found);
+            break;
+          }
+          // MODE đang kết nối wifi
+          screenOLED = SCREEN4;
+          delay(2000);
+      }
+      Serial.println("");
+      if(WiFi.status() == WL_CONNECTED) {
+          Serial.println("Da ket noi Wifi: ");
+          Serial.println("IP address: ");
+          Serial.println(WiFi.localIP()); 
+          Serial.println((char*)Essid.c_str());
+        buzzerBeep(3);
+        // MODE wifi đã kết nối, đang kết nối blynk
+        enableShow = ENABLE;
+        screenOLED = SCREEN7;
+        enableReadSepay = 1;
+        delay(2000);
+       
+        // Phát thông báo WiFi kết nối thành công
+        playAudio(audio_wifi_connected);
+        delay(2000);      
+      }
+      else {
+        digitalWrite(BUZZER, BUZZER_ON);
+        delay(2000);
+        digitalWrite(BUZZER, BUZZER_OFF);
+        // Phát thông báo kết nối WiFi thất bại
+        playAudio(audio_wifi_fail);
+        // MODE truy cập vào 192.168.4.1
+        screenOLED = SCREEN9;
+        connectAPMode(); 
+      }
+        
+    }
+}
+
+//--------------------------- switch AP Mode --------------------------- 
+void connectAPMode() {
+
+  // Khởi tạo Wifi AP Mode, vui lòng kết nối wifi ESP32, truy cập 192.168.4.1
+  WiFi.softAP(ssidAP, passwordAP);  
+  playAudio(audio_enter_setup); // Phát thông báo vào chế độ cài đặt
+  // Gửi trang HTML khi client truy cập 192.168.4.1
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
+
+  // Gửi data ban đầu đến clientgetDataFromClient
+  server.on("/data_before", HTTP_GET, [](AsyncWebServerRequest *request){
+    String json = getJsonData();
+    request->send(200, "application/json", json);
+  });
+
+  // Get data từ client
+  server.on("/post_data", HTTP_POST, [](AsyncWebServerRequest *request){
+    request->send(200, "text/plain", "SUCCESS");
+    enableShow = DISABLE;
+    screenOLED = SCREEN13;
+    delay(5000);
+    ESP.restart();
+  }, NULL, getDataFromClient);
+
+  // Start server
+  server.begin();
+}
+
+//------------------- Hàm đọc data từ client gửi từ HTTP_POST "/post_data" -------------------
+void getDataFromClient(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+  Serial.print("get data : ");
+  Serial.println((char *)data);
+  JSONVar myObject = JSON.parse((char *)data);
+  if(myObject.hasOwnProperty("ssid"))
+    Essid = (const char*) myObject["ssid"];
+  if(myObject.hasOwnProperty("pass"))
+    Epass = (const char*)myObject["pass"] ;
+  if(myObject.hasOwnProperty("api_key"))
+    EApiKey = (const char*)myObject["api_key"] ;
+  if(myObject.hasOwnProperty("va_acount"))
+    EVAacount = (const char*)myObject["va_acount"] ;
+  writeEEPROM();
+  playAudio(audio_setup_done); // Phát thông báo lưu cài đặt thành công
+
+}
+
+// ------------ Hàm in các giá trị cài đặt ------------
+void printValueSetup() {
+    Serial.print("ssid = ");
+    Serial.println(Essid);
+    Serial.print("pass = ");
+    Serial.println(Epass);
+    Serial.print("api_key = ");
+    Serial.println(EApiKey);
+    Serial.print("va_acount = ");
+    Serial.println(EVAacount);
+}
+
+//-------- Hàm tạo biến JSON để gửi đi khi có request HTTP_GET "/" --------
+String getJsonData() {
+  JSONVar myObject;
+  myObject["ssid"]  = Essid;
+  myObject["pass"]  = Epass;
+  myObject["api_key"]  = EApiKey;
+  myObject["va_acount"]  = EVAacount;
+
+
+  String jsonData = JSON.stringify(myObject);
+  return jsonData;
+}
+
+/*
+ * Các hàm liên quan đến lưu dữ liệu cài đặt vào EEPROM
+*/
+//--------------------------- Read Eeprom  --------------------------------
+void readEEPROM() {
+    for (int i = 0; i < 32; ++i)       //Reading SSID
+        Essid += char(EEPROM.read(i)); 
+    for (int i = 32; i < 64; ++i)      //Reading Password
+        Epass += char(EEPROM.read(i)); 
+    for (int i = 64; i < 200; ++i)      //Reading API Key
+        EApiKey += char(EEPROM.read(i)); 
+    for (int i = 200; i < 230; ++i)      //Reading EVAacount
+        EVAacount += char(EEPROM.read(i)); 
+    if(Essid.length() == 0) Essid = "BLK";
+
+    printValueSetup();
+}
+
+// ------------------------ Clear Eeprom ------------------------
+void clearEeprom() {
+    Serial.println("Clearing Eeprom");
+    for (int i = 0; i < 250; ++i) 
+      EEPROM.write(i, 0);
+}
+
+// -------------------- Hàm ghi data vào EEPROM ------------------
+void writeEEPROM() {
+    clearEeprom();
+    for (int i = 0; i < Essid.length(); ++i)
+          EEPROM.write(i, Essid[i]);  
+    for (int i = 0; i < Epass.length(); ++i)
+          EEPROM.write(32+i, Epass[i]);
+    for (int i = 0; i < EApiKey.length(); ++i)
+          EEPROM.write(64+i, EApiKey[i]);
+    for (int i = 0; i < EVAacount.length(); ++i)
+          EEPROM.write(200+i, EVAacount[i]);
+    EEPROM.commit();
+    Serial.println("write eeprom");
+    delay(500);
+}
+
+
+//-----------------------Task Task Button ----------
+void TaskButton(void *pvParameters) {
+    while(1) {
+      handle_button(&buttonSET);
+      delay(10);
+    }
+}
+//-----------------Hàm xử lí nút nhấn nhả ----------------------
+void button_press_short_callback(uint8_t button_id) {
+    switch(button_id) {
+      case BUTTON1_ID :  
+        buzzerBeep(1);
+        Serial.println("btSET press short");
+        screenOLED = SCREEN2;
+        enableShow = DISABLE;
+        Evolume = Evolume + 10;
+
+        if(Evolume > 100) Evolume = 0;
+        audio.setVolume(Evolume);
+        EEPROM.write(220, Evolume);
+        EEPROM.commit();
+        break;
+
+    } 
+} 
+//-----------------Hàm xử lí nút nhấn giữ ----------------------
+void button_press_long_callback(uint8_t button_id) {
+  switch(button_id) {
+    case BUTTON1_ID :
+      buzzerBeep(2);  
+      enableShow = DISABLE;
+      Serial.println("btSET press long");
+      screenOLED = SCREEN9;
+      clearOLED();
+      connectAPMode(); 
+      break;
+ 
+  } 
+} 
+// ---------------------- Hàm điều khiển còi -----------------------------
+void buzzerBeep(int numberBeep) {
+  for(int i = 0; i < numberBeep; ++i) {
+    digitalWrite(BUZZER, BUZZER_ON);
+    delay(100);
+    digitalWrite(BUZZER, BUZZER_OFF);
+    delay(100);
+  }  
+}
+// ---------------------- Hàm điều khiển còi -----------------------------
+void ledBlink(int numberBeep) {
+  for(int i = 0; i < numberBeep; ++i) {
+    digitalWrite(LED, ENABLE);
+    delay(200);
+    digitalWrite(LED, ENABLE);
+    delay(100);
+  }  
+}
+// ---------------------- Hàm điều khiển LED -----------------------------
+void blinkLED(int numberBlink) {
+  for(int i = 0; i < numberBlink; ++i) {
+    digitalWrite(LED, DISABLE);
+    delay(300);
+    digitalWrite(LED, ENABLE);
+    delay(300);
+  }  
+}
