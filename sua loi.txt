@@ -1,0 +1,827 @@
+// Chức năng nút nhấn BOOT:
+//   - Nhấn nhanh 1 lần để tăng âm lượng:
+//   - Nhấn giữ 3s để vào chế độ cài đặt: Giữ nút BOOT trên kit esp32 để vào chế độ APMODE, esp32 sẽ phát ra wifi tên Tingbox, 
+//     Kết nối vào wifi đó, truy cập 192.168.4.1, cấu hình các thông số:
+//       + tên WIFI
+//       + Mật khẩu WIFI
+//       + API Token của Sepay
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include "index_html.h"
+#include "data_config.h"
+#include <EEPROM.h>
+#include <Arduino_JSON.h>
+#include "icon.h"
+#include <HTTPClient.h>
+#include "Audio.h"
+#include <math.h>
+#include <time.h>
+#include <SPI.h>
+#include <U8g2lib.h>
+
+#define STABLE_CHECKS       10     // số lần kiểm PPS để ổn định
+#define STABLE_INTERVAL_MS  100    // ms giữa mỗi lần kiểm
+// MÃ THIẾT BỊ CỐ ĐỊNH: chỉ coi GD mới khi description có chứa chuỗi này
+const String deviceCode = "LN3801";
+// Chân điều khiển relay mới
+const int relayPin = 13;
+const int sensorPin = 33;
+const int N_RANGES      = 8;
+const float ppsThresholds[N_RANGES] = { 20.0f,30.0f,40.0f,50.0f,60.0f,70.0f,80.0f,90.0f };
+const float CF_values[N_RANGES]     = { 4150,4250,4350,4450,4550,4650,4750,4850 };
+volatile uint32_t pulseCountSec = 0;    // xung trong mỗi giây
+float totalVolumeL = 0.0f;              // tích lũy thể tích (L)
+unsigned long lastSecondMillis = 0;     // timebase 1s
+// Lưu PPS (xung/giây) vừa đo được để TaskReadSepay tham chiếu
+volatile uint32_t currentPPS    = 0;
+// ISR: mỗi xung FALLING tăng counter
+void IRAM_ATTR pulseCounter() {
+  pulseCountSec++;
+}
+/**
+ * Parse chuỗi "dd/MM/yyyy HH:mm:ss" và kiểm tra xem có mới trong 15 phút hay không.
+ * @param dateStr Chuỗi postingDate như "08/05/2025 03:59:59"
+ * @return true nếu dateStr ≤ 15 phút so với now, false otherwise
+ */
+bool isPostingDateRecent(const String &dateStr) {
+  // 1) Chuyển String → char[]
+  char buf[20];
+  dateStr.toCharArray(buf, sizeof(buf));
+  // 2) sscanf để lấy day, month, year, hour, min, sec
+  int day, month, year, hour, minute, second;
+  if (sscanf(buf, "%d/%d/%d %d:%d:%d",
+             &day, &month, &year,
+             &hour, &minute, &second) != 6) {
+    return false;  // parse lỗi xem như cũ
+  }
+  // 3) Điền vào tm và mktime
+  struct tm tm_txn = {0};
+  tm_txn.tm_mday  = day;
+  tm_txn.tm_mon   = month - 1;
+  tm_txn.tm_year  = year  - 1900;
+  tm_txn.tm_hour  = hour;
+  tm_txn.tm_min   = minute;
+  tm_txn.tm_sec   = second;
+  tm_txn.tm_isdst = 0;
+  time_t txn_time = mktime(&tm_txn);
+
+  // 4) So sánh với now
+  time_t now = time(NULL);
+  double diff = difftime(now, txn_time);
+  return (diff >= 0 && diff <= 15 * 60);
+}
+
+// Khai báo I2S
+#define I2S_DOUT 25
+#define I2S_BCLK 26
+#define I2S_LRC 27
+Audio audio;
+bool isPlaying = false;
+HTTPClient http;
+
+struct Transaction {
+String refNo;
+String tranId;
+String postingDate;
+String transactionDate;
+String accountNo;
+int creditAmount;
+String currency;
+String description;
+String availableBalance;
+String beneficiaryAccount;
+};
+
+Transaction transactions[3];
+int soLuongGD = 0;
+int tienNhan[3] = {0,0,0};
+void themTien(int x) {
+    // đẩy mảng sang trái và thêm phần tử mới
+    tienNhan[0] = tienNhan[1];
+    tienNhan[1] = tienNhan[2];
+    tienNhan[2] = x;
+}
+
+String apiUrl = "";
+String url_ting_ting = "http://tiengdong.com/wp-content/uploads/Tieng-tinh-tinh-www_tiengdong_com.mp3";
+String reference_number_now = "";  // Biến lưu mã tham chiếu từ lần đọc trước 
+
+static uint8_t   lastTrigAudio = 0;    // lưu giá trị trigAudio lần trước
+volatile uint8_t trigAudio = 0;
+int amount_inGiaoDich = 0;
+uint8_t firstTrans = 0;
+int countTaskReadSepay = 0;
+// Create AsyncWebServer object on port 80
+AsyncWebServer server(80);
+
+int Volume = 10;
+// Khai bao LED
+#define LED           2
+// Khai báo BUZZER
+#define BUZZER        12
+#define BUZZER_ON     1
+#define BUZZER_OFF    0
+// khai báo nút ấn
+#define BUTTON_PIN       14
+#define DEBOUNCE_DELAY   200
+volatile bool manualRelayState = false;       // false = LOW, true = HIGH
+volatile unsigned long lastDebounceTime = 0;  // dùng cho debounce
+// Khi true nghĩa là đang trong block đo lưu lượng
+volatile bool measurementActive = false;
+// Cờ để biết có cần check giao dịch mới không
+volatile bool checkTransaction = false;
+bool initialFetchDone = false;  
+//-------------------- Khai báo Button-----------------------
+#include "mybutton.h"
+#define BUTTON_SET_PIN    0
+#define BUTTON1_ID  1
+
+Button buttonSET;
+Button buttonDOWN;
+Button buttonUP;
+void button_press_short_callback(uint8_t button_id);
+void button_press_long_callback(uint8_t button_id);
+//------------------------------------------------------------
+TaskHandle_t TaskButton_handle      = NULL;
+TaskHandle_t TaskOLEDDisplay_handle = NULL;
+TaskHandle_t TaskDHT11_handle = NULL;
+TaskHandle_t TaskDustSensor_handle = NULL;
+TaskHandle_t TaskAutoWarning_handle = NULL;
+void TaskAudio(void *pvParameters);
+// Đọc tối đa maxLen byte từ EEPROM, dừng khi gặp 0x00 hoặc 0xFF
+String readEepromString(int addr, int maxLen) {
+  char buf[maxLen+1];
+  for (int i = 0; i < maxLen; i++) {
+    uint8_t c = EEPROM.read(addr + i);
+    if (c == 0x00 || c == 0xFF) {
+      buf[i] = '\0';
+      break;
+    }
+    buf[i] = char(c);
+  }
+  buf[maxLen] = '\0'; 
+  return String(buf);
+}
+//--------------------------- Read Eeprom  --------------------------------
+void readEEPROM() {
+  // 0–31: Essid (32 bytes)
+  Essid     = readEepromString(  0,  32);
+  // 32–63: Epass (32 bytes)
+  Epass     = readEepromString( 32,  32);
+  // 64–199: EApiKey (136 bytes)
+  EApiKey   = readEepromString( 64, 136);
+  // 200–229: EVAacount (30 bytes)
+  EVAacount = readEepromString(200,  30);
+
+  if (Essid.length() == 0) Essid = "BLK";
+  printValueSetup();
+}
+// ISR để xử lý nhấn nút
+void IRAM_ATTR handleButtonInterrupt() {
+  unsigned long now = millis();
+  // simple debounce
+  if (now - lastDebounceTime < DEBOUNCE_DELAY) return;
+  lastDebounceTime = now;
+  // Đảo trạng thái manual
+  manualRelayState = !manualRelayState;
+  digitalWrite(relayPin, manualRelayState ? HIGH : LOW);
+  checkTransaction = true;
+}
+void setup(){
+  Serial.begin(115200);
+  // Đọc data setup từ eeprom
+  EEPROM.begin(512);
+  readEEPROM();
+    // Khởi tạo LED
+  pinMode(LED, OUTPUT);
+  // Thiết lập relayPin
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, LOW);  // đảm bảo relay đóng lúc khởi động
+    // --- Cấu hình nút nhấn ---
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  // Gắn interrupt: FALLING là khi nút được nhấn xuống nối GND (pull-up)
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonInterrupt, FALLING);
+  // —— Khởi tạo flow sensor ——
+  pinMode(sensorPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(sensorPin), pulseCounter, FALLING);
+  lastSecondMillis = millis();
+  // Tạo task đo lưu lượng mỗi giây (FreeRTOS)
+  xTaskCreatePinnedToCore(
+  [](void*){
+     while (1) {
+       unsigned long now = millis();
+       if (now - lastSecondMillis >= 1000) {
+         lastSecondMillis += 1000;
+         uint32_t pps = pulseCountSec;
+         pulseCountSec = 0;
+         currentPPS = pps;    // cập nhật PPS cho TaskReadSepay
+         // chọn CF phù hợp
+         float CF = CF_values[N_RANGES-1];
+         for (int i = 0; i < N_RANGES; i++) {
+           if (pps < ppsThresholds[i]) { CF = CF_values[i]; break; }
+         }
+         // cộng dồn thể tích (L)
+         totalVolumeL += (float)pps / CF;
+       }
+       vTaskDelay(pdMS_TO_TICKS(100));
+     }
+   },
+   "TaskFlowMeasure",
+   2048, nullptr,
+   1, nullptr,
+   0
+ );
+  // Khởi tạo BUZZER
+  pinMode(BUZZER, OUTPUT);
+  digitalWrite(BUZZER, BUZZER_OFF);
+  // Khởi tạo URL API động sau khi đọc dữ liệu từ EEPROM
+    apiUrl = "https://apicanhan.com/api/mbbank?key=8c622baf3efef5ef8386a082933d9467";
+    apiUrl += "&username=" + EApiKey; // Thêm username từ EApiKey
+    apiUrl += "&password=" + EVAacount; // Thêm password từ EVAacount
+    apiUrl += "&accountNo=" + EApiKey; // Thêm accountNo từ EApiKey
+    // Debug URL để kiểm tra
+    Serial.print("Generated API URL: ");
+    Serial.println(apiUrl);
+  // Khởi tạo nút nhấn
+  pinMode(BUTTON_SET_PIN, INPUT_PULLUP);
+  button_init(&buttonSET, BUTTON_SET_PIN, BUTTON1_ID);
+  button_pressshort_set_callback((void *)button_press_short_callback);
+  button_presslong_set_callback((void *)button_press_long_callback);
+  xTaskCreatePinnedToCore(TaskReadSepay, "TaskReadSepay", 4096, NULL, 4, NULL, 1);
+  // khởi tạo audio
+  static TaskHandle_t TaskAudio_handle = NULL;
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  audio.setVolume(100);
+
+  xTaskCreatePinnedToCore(
+    TaskAudio,               // hàm task
+    "TaskAudio",             // tên
+    4096,                    // stack size (words) ~16KB
+    NULL,                    // params
+    3,                       // priority (vừa phải)
+    &TaskAudio_handle,       // handle nếu cần
+    0                        // **core 0** ← đúng
+  );
+  Evolume = EEPROM.read(220);
+  if(Evolume == 255) Evolume = 10;
+  Serial.print("Volume:");
+  Serial.println(Evolume);
+  // Kết nối wifi
+  connectSTA();
+  // Ví dụ múi giờ GMT+7 cho Việt Nam
+  const long gmtOffset_sec = 7 * 3600;
+  const int daylightOffset_sec = 0;
+  configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
+  // Khởi màn hình OLED
+  u8g2.begin();
+}
+void loop() {
+  vTaskDelete(NULL);
+}
+bool enableReadSepay = 0;
+void TaskReadSepay(void *pvParameters) {
+  bool       noFlowDetected;
+  bool       initialOK;
+  bool       measuredOK;
+  uint32_t   requiredLiters;
+  while(1) {
+    int transCount = 0;
+    if(checkTransaction && enableReadSepay == 1) {
+      checkTransaction = false;
+      Serial.println("Button pressed → checking transactions…");
+      if (WiFi.status() == WL_CONNECTED && trigAudio == 0) {
+        // Lấy thông tin 3 giao dịch gần nhất
+        HTTPClient http;
+        http.begin("https://keymixi.com/api/transactions.json");
+        http.addHeader("Content-Type", "application/json");
+        int httpResponseCode = http.GET();
+        if (httpResponseCode == 200) {
+          String response = http.getString();
+          Serial.println("Response:");
+          Serial.println(response);
+
+          JSONVar jsonObj = JSON.parse(response);
+          if (JSON.typeof(jsonObj) == "undefined") {
+              Serial.println("Failed to parse JSON");
+              continue;
+          }
+          // Nếu API trả về lỗi
+          if (jsonObj.hasOwnProperty("type") && String((const char*)jsonObj["type"]) == "error") {
+            Serial.println("API error: " + String((const char*)jsonObj["message"]));
+            continue;
+          }
+          // Nếu có TranList, parse nó
+          if (!jsonObj.hasOwnProperty("TranList")) {
+              Serial.println("No TranList in JSON");
+              continue;
+          }
+          // Lấy TranList và số phần tử
+          JSONVar transArray = jsonObj["TranList"];
+          int len   = transArray.length();         // số phần tử thực tế
+          transCount = len < 3 ? len : 3;                  // chỉ lấy tối đa 3 giao dịch
+          Serial.printf("transCount = %d\n", transCount);
+          // Gán dữ liệu cho 0..count-1
+          for (int j = 0; j < transCount; j++) {
+              JSONVar item = transArray[j];
+              transactions[j].refNo           = (const char*)item["refNo"];
+              transactions[j].tranId           = (const char*)item["tranId"];
+              transactions[j].postingDate      = (const char*)item["postingDate"];
+              transactions[j].transactionDate  = (const char*)item["transactionDate"];
+              transactions[j].accountNo        = (const char*)item["accountNo"];
+              transactions[j].creditAmount     = String((const char*)item["creditAmount"]).toInt();
+              transactions[j].currency         = (const char*)item["currency"];
+              transactions[j].description      = (const char*)item["description"];
+              transactions[j].availableBalance = (const char*)item["availableBalance"];
+              transactions[j].beneficiaryAccount = (const char*)item["beneficiaryAccount"];
+          }
+          // Nếu count < 3, zero-out những phần tử thừa để tránh giữ dữ liệu rác
+          for (int j = transCount; j < 3; j++) {
+              transactions[j] = Transaction();
+          }
+
+        } else {
+            Serial.print("Error on HTTP request: ");
+            Serial.println(httpResponseCode);
+            continue;
+        }
+        http.end();
+        // Kiểm tra nếu code == 200 là đọc thành công
+        if (httpResponseCode == 200) {
+          if (firstTrans == 0) {
+            firstTrans = 1;
+            // Chỉ gán khi có đủ phần tử
+            if (transCount > 0) tienNhan[0] = transactions[0].creditAmount;
+            if (transCount > 1) tienNhan[1] = transactions[1].creditAmount;
+            if (transCount > 2) tienNhan[2] = transactions[2].creditAmount;
+
+            if (transCount > 0) {
+                reference_number_now = transactions[0].tranId;
+                Serial.println("reference_number_now: " + reference_number_now);
+            }
+            Serial.printf("tienNhan = [%d, %d, %d]\n", tienNhan[0], tienNhan[1], tienNhan[2]);
+          }
+          else {  // sau lần đầu
+            if (firstTrans != 0 && trigAudio == 0) {
+              // 1) Kiểm tra xem postingDate có mới (≤15 phút) hay không
+              if (!isPostingDateRecent(transactions[0].postingDate)) {
+                // giao dịch cũ → luôn phát audio 5
+                trigAudio = 5;
+                Serial.println("TaskReadSepay: set trigAudio=5");
+                vTaskDelay(pdMS_TO_TICKS(500));   // hoặc 1000 ms tuỳ bạn
+                continue;                         // quay lại đầu while, không return
+              }
+              Serial.printf("checking new tx, reference_number_now = %s\n", reference_number_now.c_str());
+              int viTri = kiemTrareference_number(reference_number_now);
+              Serial.printf("viTri = %d\n", viTri);
+              // viTri > 0: có giao dịch mới tại index 0
+              if (viTri > 0) {
+                
+                // chỉ xử lý GD nếu description chứa đúng deviceCode
+                if (transactions[0].description.indexOf(deviceCode) >= 0) {
+                  reference_number_now  = transactions[0].tranId;
+                  amount_inGiaoDich     = transactions[0].creditAmount;
+                  if (amount_inGiaoDich > 0) {
+                    themTien(amount_inGiaoDich);
+                    // --- START measurement block ---
+                    // 1) Bắt đầu đo → bật flag
+                    measurementActive = true;
+                    // 1) Reset trạng thái
+                    noFlowDetected = false;
+                    totalVolumeL    = 0.0f;
+
+                    // 2) MỞ relay & phát audio 1 lần
+                    digitalWrite(relayPin, LOW);
+                    if (trigAudio == 0) {
+                      trigAudio = 1;
+                      Serial.println("TaskReadSepay: set trigAudio=1");
+                    }
+
+                    // 3) Tính số lít cần cấp
+                    requiredLiters = (uint32_t)round(amount_inGiaoDich / 1000.0);
+
+                    // 4) INITIAL WAIT: nếu 1s đầu PPS>20 thì ok, 
+                    //    else nếu PPS==0 thì chờ tới 5 phút để đợi xung đầu tiên,
+                    //    else nếu 0<PPS<20 thì thực hiện stable-check 3 nhịp.
+                      unsigned long t0 = millis();
+                      bool initOK = false;
+
+                      // 4.1) Tác vụ 1s đầu tiên: tìm PPS>20
+                      while (millis() - t0 < 1000) {
+                        if (currentPPS > 20) { initOK = true; break; }
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                      }
+
+                      if (!initOK) {
+                        // 4.2) PPS == 0 → chờ flow hoặc timeout 5 phút
+                        if (currentPPS == 0) {
+                          Serial.println("Initial no-flow → chờ flow hoặc timeout 5 phút");
+                          unsigned long waitStart = millis();
+                          bool gotFlow = false;
+                          while (millis() - waitStart < 5UL*60UL*1000UL) {
+                            if (currentPPS > 0) { gotFlow = true; break; }
+                            vTaskDelay(pdMS_TO_TICKS(500));
+                          }
+                          if (!gotFlow) {
+                            Serial.println("Still no-flow sau 5 phút → bỏ qua");
+                            noFlowDetected = true;
+                            digitalWrite(relayPin, LOW);
+                          } else {
+                            initOK = true;
+                          }
+                        }
+                        // 4.3) 0 < PPS < 20
+                        else {
+                                // flow>0 nhưng <20: chờ thêm STABLE_CHECKS nhịp, vẫn đo volume liên tục
+                          Serial.printf("Initial flow nhỏ >0: chờ ổn định %d nhịp\n", STABLE_CHECKS);
+                          int detected = 0;
+                          for (int i = 0; i < STABLE_CHECKS; i++) {
+                            // Trong thời gian này TaskFlowMeasure vẫn cập nhật totalVolumeL
+                            vTaskDelay(pdMS_TO_TICKS(STABLE_INTERVAL_MS));
+                            Serial.printf("  nhịp %2d: PPS=%3u, Tổng L=%.3f\n",
+                                          i+1, currentPPS, totalVolumeL);
+                            if (currentPPS > 0) {
+                              detected++;
+                            }
+                          }
+                          if (detected > 0) {
+                            Serial.println("Flow ổn định: tiếp tục đo");
+                            initOK = true;
+                          } else {
+                            Serial.printf("Không ổn định sau %d nhịp → bỏ qua\n", STABLE_CHECKS);
+                            noFlowDetected = true;
+                            digitalWrite(relayPin, LOW);
+                          }
+                        }
+                      }
+
+                      // Nếu initial vẫn fail → bỏ luôn, không vào Measurement Loop
+                      if (!initOK) {
+                        digitalWrite(relayPin, LOW);
+                        measurementActive = false;
+                        manualRelayState  = false;
+                        // trigger no-flow audio
+                        if (trigAudio == 0) {
+                          trigAudio = 2;
+                          Serial.println("TaskReadSepay: set trigAudio=2");
+                        }
+                        printTransactions(0);
+                        vTaskDelay(pdMS_TO_TICKS(1000));
+                        continue;  // quay lại outer loop
+                      }
+
+                    // 5) MEASUREMENT LOOP: đo cho tới khi đủ hoặc no-flow giữa chừng
+                    while (totalVolumeL < requiredLiters) {
+                      if (currentPPS == 0) {
+                        Serial.println("Measurement: PPS=0 giữa chừng → no-flow");
+                        digitalWrite(relayPin, LOW);
+                        noFlowDetected = true;
+                        break;
+                      }
+                      if (currentPPS < 20) {
+                        Serial.printf("Measurement: PPS=%u <20 (flow yếu) → pause 5 phút\n", currentPPS);
+                        measurementActive = false;
+                        digitalWrite(relayPin, LOW);
+                        vTaskDelay(pdMS_TO_TICKS(5 * 60 * 1000));
+                        measurementActive = true;
+                        Serial.println("Measurement: mở relay lại sau flow yếu");
+                        digitalWrite(relayPin, HIGH);
+                        continue;
+                      }
+                      vTaskDelay(pdMS_TO_TICKS(100));
+                    }
+
+                    // 6) XỬ LÝ KẾT QUẢ
+                    if (noFlowDetected) {
+                      digitalWrite(relayPin, LOW);
+                      measurementActive = false;
+                      manualRelayState  = false;
+                      if (trigAudio == 0) {
+                        trigAudio = 2;
+                        Serial.println("TaskReadSepay: set trigAudio=2");
+                      }
+                      printTransactions(0);
+                      vTaskDelay(pdMS_TO_TICKS(1000));
+                      continue;
+                    }
+
+                    // 7) ĐỦ LƯU LƯỢNG
+                    Serial.println("Measurement: đủ lưu lượng → đóng relay");
+                    digitalWrite(relayPin, LOW);
+                    if (trigAudio == 0) {
+                      trigAudio = 3;
+                      Serial.println("TaskReadSepay: set trigAudio=3");
+                    }
+                    printTransactions(0);
+                    measurementActive = false;
+                    manualRelayState  = false;
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    continue;
+                    // --- END measurement block ---
+                  }
+                }
+                else {
+                    Serial.println("Giao dịch mới không chứa mã thiết bị, bỏ qua.");
+                }
+              }
+              // viTri == 0: chưa có giao dịch mới → bỏ qua
+              // viTri == -1: reference cũ không thấy → xem như có >=3 giao dịch mới
+              else if (trigAudio == 0) {
+                trigAudio = 5;
+                Serial.println("TaskReadSepay: set trigAudio=5");
+              }
+            }
+          }
+        } else {
+            Serial.println("Lỗi lấy dữ liệu. Vui lòng đợi lần lấy dữ liệu tiếp theo!");
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));  // check giao dịch mỗi giây     
+  }
+}
+// In giao dịch
+void printTransactions(int i) {
+    Serial.println("refNo: "           + transactions[i].refNo);
+    Serial.println("tranId: "          + transactions[i].tranId);
+    Serial.println("postingDate: "     + transactions[i].postingDate);
+    Serial.println("transactionDate: " + transactions[i].transactionDate);
+    Serial.println("accountNo: "       + transactions[i].accountNo);
+    Serial.println("creditAmount: "    + String(transactions[i].creditAmount));
+    Serial.println("currency: "        + transactions[i].currency);
+    Serial.println("description: "     + transactions[i].description);
+    Serial.println("availableBalance: "+ transactions[i].availableBalance);
+    Serial.println("beneficiaryAccount: " + transactions[i].beneficiaryAccount);
+}
+
+
+
+// Hàm kiểm tra mã tham chiếu có trong danh sách không
+int kiemTrareference_number(String reference_number) {
+    for (int i = 0; i < 3; i++) {
+        if (transactions[i].tranId == reference_number)
+            return i;
+    }
+    return -1;
+}
+//-----------------Kết nối STA wifi, chuyển sang wifi AP nếu kết nối thất bại ----------------------- 
+void connectSTA() {
+      delay(5000);
+      if ( Essid.length() > 1 ) {  
+      Serial.println((char*)Essid.c_str());        //Print SSID
+      Serial.println((char*)Epass.c_str());        //Print Password
+
+      WiFi.begin(Essid.c_str(), Epass.c_str());   //c_str()
+      int countConnect = 0;
+      while (WiFi.status() != WL_CONNECTED) {
+          delay(500);   
+          if(countConnect++  == 15) {
+            Serial.println("Ket noi Wifi that bai");
+            Serial.println("Kiem tra SSID & PASS");
+            Serial.println("Ket noi Wifi: ESP32 de cau hinh");
+            Serial.println("IP: 192.168.4.1");
+            digitalWrite(BUZZER, BUZZER_ON);
+            delay(2000);
+            digitalWrite(BUZZER, BUZZER_OFF);
+            delay(3000);
+            break;
+          }
+      }
+      Serial.println("");
+      if(WiFi.status() == WL_CONNECTED) {
+          Serial.println("Da ket noi Wifi: ");
+          Serial.println("IP address: ");
+          Serial.println(WiFi.localIP()); 
+          Serial.println((char*)Essid.c_str());
+          audio.connecttospeech("Kết nối thành công wifi", "vi");
+          while (audio.isRunning()) {
+            audio.loop();
+          }
+        buzzerBeep(3);
+        // MODE wifi đã kết nối, đang kết nối blynk
+        enableReadSepay = 1;
+        checkTransaction = true;    // ← kích chạy ngay lần fetch đầu
+        delay(2000);
+        
+        
+      }
+      else {
+        digitalWrite(BUZZER, BUZZER_ON);
+        delay(2000);
+        digitalWrite(BUZZER, BUZZER_OFF);
+        // MODE truy cập vào 192.168.4.1
+        connectAPMode(); 
+      }
+        
+    }
+}
+
+//--------------------------- switch AP Mode --------------------------- 
+void connectAPMode() {
+
+  // Khởi tạo Wifi AP Mode, vui lòng kết nối wifi ESP32, truy cập 192.168.4.1
+  WiFi.softAP(ssidAP, passwordAP);  
+
+  // Gửi trang HTML khi client truy cập 192.168.4.1
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
+
+  // Gửi data ban đầu đến clientgetDataFromClient
+  server.on("/data_before", HTTP_GET, [](AsyncWebServerRequest *request){
+    String json = getJsonData();
+    request->send(200, "application/json", json);
+  });
+
+  // Get data từ client
+  server.on("/post_data", HTTP_POST, [](AsyncWebServerRequest *request){
+    request->send(200, "text/plain", "SUCCESS");
+    delay(5000);
+    ESP.restart();
+  }, NULL, getDataFromClient);
+
+  // Start server
+  server.begin();
+}
+
+//------------------- Hàm đọc data từ client gửi từ HTTP_POST "/post_data" -------------------
+void getDataFromClient(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+  Serial.print("get data : ");
+  Serial.println((char *)data);
+  JSONVar myObject = JSON.parse((char *)data);
+  if(myObject.hasOwnProperty("ssid"))
+    Essid = (const char*) myObject["ssid"];
+  if(myObject.hasOwnProperty("pass"))
+    Epass = (const char*)myObject["pass"] ;
+  if(myObject.hasOwnProperty("api_key"))
+    EApiKey = (const char*)myObject["api_key"] ;
+  if(myObject.hasOwnProperty("va_acount"))
+    EVAacount = (const char*)myObject["va_acount"] ;
+  writeEEPROM();
+  
+
+}
+
+// ------------ Hàm in các giá trị cài đặt ------------
+void printValueSetup() {
+    Serial.print("ssid = ");
+    Serial.println(Essid);
+    Serial.print("pass = ");
+    Serial.println(Epass);
+    Serial.print("api_key = ");
+    Serial.println(EApiKey);
+    Serial.print("va_acount = ");
+    Serial.println(EVAacount);
+}
+
+//-------- Hàm tạo biến JSON để gửi đi khi có request HTTP_GET "/" --------
+String getJsonData() {
+  JSONVar myObject;
+  myObject["ssid"]  = Essid;
+  myObject["pass"]  = Epass;
+  myObject["api_key"]  = EApiKey;
+  myObject["va_acount"]  = EVAacount;
+
+
+  String jsonData = JSON.stringify(myObject);
+  return jsonData;
+}
+
+// ------------------------ Clear Eeprom ------------------------
+void clearEeprom() {
+    Serial.println("Clearing Eeprom");
+    for (int i = 0; i < 250; ++i) 
+      EEPROM.write(i, 0);
+}
+
+// -------------------- Hàm ghi data vào EEPROM ------------------
+void writeEEPROM() {
+    clearEeprom();
+    for (int i = 0; i < Essid.length(); ++i)
+          EEPROM.write(i, Essid[i]);  
+    for (int i = 0; i < Epass.length(); ++i)
+          EEPROM.write(32+i, Epass[i]);
+    for (int i = 0; i < EApiKey.length(); ++i)
+          EEPROM.write(64+i, EApiKey[i]);
+    for (int i = 0; i < EVAacount.length(); ++i)
+          EEPROM.write(200+i, EVAacount[i]);
+    EEPROM.commit();
+    Serial.println("write eeprom");
+    delay(500);
+}
+
+
+//-----------------------Task Task Button ----------
+void TaskButton(void *pvParameters) {
+    while(1) {
+      handle_button(&buttonSET);
+      delay(10);
+    }
+}
+//-----------------Hàm xử lí nút nhấn nhả ----------------------
+void button_press_short_callback(uint8_t button_id) {
+    switch(button_id) {
+      case BUTTON1_ID :  
+        buzzerBeep(1);
+        Serial.println("btSET press short");
+        Evolume = Evolume + 10;
+
+        if(Evolume > 100) Evolume = 0;
+        audio.setVolume(Evolume);
+        EEPROM.write(220, Evolume);
+        EEPROM.commit();
+        break;
+
+    } 
+} 
+//-----------------Hàm xử lí nút nhấn giữ ----------------------
+void button_press_long_callback(uint8_t button_id) {
+  switch(button_id) {
+    case BUTTON1_ID :
+      buzzerBeep(2);  
+      Serial.println("btSET press long");
+      connectAPMode(); 
+      break;
+ 
+  } 
+} 
+// ---------------------- Hàm điều khiển còi -----------------------------
+void buzzerBeep(int numberBeep) {
+  for(int i = 0; i < numberBeep; ++i) {
+    digitalWrite(BUZZER, BUZZER_ON);
+    delay(100);
+    digitalWrite(BUZZER, BUZZER_OFF);
+    delay(100);
+  }  
+}
+// ---------------------- Hàm điều khiển còi -----------------------------
+void ledBlink(int numberBeep) {
+  for(int i = 0; i < numberBeep; ++i) {
+    digitalWrite(LED, HIGH);
+    delay(200);
+    digitalWrite(LED, LOW);
+    delay(100);
+  }
+}
+// ---------------------- Hàm điều khiển LED -----------------------------
+void blinkLED(int numberBlink) {
+  for(int i = 0; i < numberBlink; ++i) {
+    digitalWrite(LED, LOW);
+    delay(300);
+    digitalWrite(LED, HIGH);
+    delay(300);
+  }
+}
+void TaskAudio(void* pvParameters) {
+  for (;;) {
+    // 1) Phát hiện edge: chỉ khi trigAudio ≠ 0 và khác lastTrigAudio
+    if (!isPlaying && trigAudio != 0 && trigAudio != lastTrigAudio) {
+      lastTrigAudio = trigAudio;
+      isPlaying     = true;
+
+      // 2) Chọn thông báo theo giá trị
+      switch (trigAudio) {
+        case 1:
+          Serial.println("Audio: giao dịch thành công, mở relay");
+          audio.connecttospeech("Giao dịch thành công, mở van cấp nước", "vi");
+          break;
+        case 2:
+          Serial.println("Audio: không phát hiện đầu ra, liên hệ hỗ trợ");
+          audio.connecttospeech("Không phát hiện đầu ra, liên hệ hotline để được hỗ trợ", "vi");
+          break;
+        case 3:
+          Serial.println("Audio: đã đủ nước, kết thúc cấp nước");
+          audio.connecttospeech("Đã đủ nước, kết thúc cấp nước", "vi");
+          break;
+        case 4:
+          Serial.println("Audio: ấn để thử lại");
+          audio.connecttospeech("ấn để thử lại", "vi");
+          break;
+        case 5:
+          Serial.println("Audio: không phát hiện giao dịch mới, xin vui lòng thử lại");
+          audio.connecttospeech("không phát hiện giao dịch mới, xin vui lòng thử lại", "vi");
+          break;
+        default:
+          break;
+      }
+    }
+
+    // 3) Nếu đang phát, phải gọi audio.loop() liên tục cho đến khi xong
+    if (isPlaying) {
+      if (audio.isRunning()) {
+        audio.loop();
+      } else {
+        // 4) Khi phát xong, reset trạng thái để chờ trigger tiếp theo
+        isPlaying     = false;
+        trigAudio     = 0;
+        lastTrigAudio = 0;
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
